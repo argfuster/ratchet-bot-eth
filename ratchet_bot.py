@@ -323,6 +323,18 @@ def orden_ejecutada(symbol, order_id):
     except BinanceAPIException:
         return False
 
+def buscar_stop_existente(symbol):
+    """Busca si ya hay una orden STOP_MARKET abierta para el symbol (por ejemplo,
+    colocada manualmente). Devuelve el orderId y stopPrice si existe, o None."""
+    try:
+        ordenes = client.futures_get_open_orders(symbol=symbol)
+        for o in ordenes:
+            if o["type"] == "STOP_MARKET":
+                return {"orderId": o["orderId"], "stopPrice": float(o["stopPrice"])}
+    except BinanceAPIException as e:
+        log.warning(f"No se pudo consultar ordenes abiertas: {e}")
+    return None
+
 def posicion_abierta(symbol):
     """Devuelve la cantidad neta de la posicion actual en el exchange (0 si esta plana)."""
     posiciones = client.futures_position_information(symbol=symbol)
@@ -353,6 +365,39 @@ def ciclo():
 
     # --- Caso 1: en posicion ---
     if estado["position"] is not None:
+        # PRIORIDAD MAXIMA: si hay posicion pero no hay SL colocado (por ejemplo, porque
+        # la colocacion del SL fallo despues de abrir la posicion), reintentar el SL
+        # antes de cualquier otra cosa -- una posicion sin SL es el estado mas peligroso.
+        if estado["sl_order_id"] is None and sl_price_calc is not None:
+            # primero chequear si ya existe un SL puesto manualmente en el exchange,
+            # antes de crear uno nuevo y duplicarlo
+            existente = buscar_stop_existente(SYMBOL)
+            if existente is not None:
+                notify(f"Se encontro un SL ya existente en el exchange (colocado manualmente u otro origen) a {existente['stopPrice']}. Adoptando ese, sin crear uno nuevo.")
+                estado["sl_order_id"] = existente["orderId"]
+                estado["sl_price"] = existente["stopPrice"]
+                estado["current_period_open_time"] = periodo_ms
+                guardar_estado(estado)
+                return
+
+            notify(f"ALERTA: posicion {estado['position']} sin SL colocado. Reintentando colocar SL de emergencia...", level="warning")
+            try:
+                qty = abs(posicion_abierta(SYMBOL))
+                if qty > 0:
+                    orden_sl = con_reintentos(colocar_sl, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
+                    estado["sl_order_id"] = orden_sl["orderId"]
+                    estado["sl_price"] = sl_price_calc
+                    estado["current_period_open_time"] = periodo_ms
+                    guardar_estado(estado)
+                    notify(f"SL de emergencia colocado correctamente a {sl_price_calc}")
+                else:
+                    notify("La posicion ya no existe en el exchange (se debe haber cerrado manualmente). Reseteando estado.", level="warning")
+                    estado = estado_default()
+                    guardar_estado(estado)
+            except Exception as e:
+                notify(f"CRITICO: no se pudo colocar el SL de emergencia tras varios reintentos: {e}. Requiere intervencion manual inmediata.", level="error")
+            return
+
         # chequear si el SL se ejecuto
         if orden_ejecutada(SYMBOL, estado["sl_order_id"]) or (DRY_RUN and False):
             notify(f"SL tocado en {estado['position']} @ {estado['sl_price']}. Pasando a espera de reentrada.")
@@ -414,20 +459,54 @@ def ciclo():
     # --- Caso 3: plano, sin espera activa -> evaluar entrada nueva ---
     if direccion_regimen is not None:
         precio_actual = obtener_precio_actual(SYMBOL)
-        orden_entrada = abrir_posicion(SYMBOL, direccion_regimen, precio_actual)
+        orden_entrada = con_reintentos(abrir_posicion, 4, 3, SYMBOL, direccion_regimen, precio_actual)
         estado["position"] = direccion_regimen
         estado["entry_price"] = float(orden_entrada.get("avgPrice", precio_actual)) or precio_actual
-        if sl_price_calc is not None:
-            qty = abs(posicion_abierta(SYMBOL)) if not DRY_RUN else float(orden_entrada.get("executedQty", 0))
-            orden_sl = colocar_sl(SYMBOL, direccion_regimen, sl_price_calc, qty)
-            estado["sl_order_id"] = orden_sl["orderId"]
-            estado["sl_price"] = sl_price_calc
+        estado["sl_order_id"] = None  # todavia no colocado -- se guarda YA asi el proximo ciclo lo detecta si algo falla abajo
         estado["current_period_open_time"] = periodo_ms
+        guardar_estado(estado)
+        notify(f"Posicion abierta, guardando estado antes de intentar el SL...")
+
+        if sl_price_calc is not None:
+            try:
+                qty = abs(posicion_abierta(SYMBOL)) if not DRY_RUN else float(orden_entrada.get("executedQty", 0))
+                orden_sl = con_reintentos(colocar_sl, 8, 3, SYMBOL, direccion_regimen, sl_price_calc, qty)
+                estado["sl_order_id"] = orden_sl["orderId"]
+                estado["sl_price"] = sl_price_calc
+                guardar_estado(estado)
+            except Exception as e:
+                notify(f"ALERTA: posicion abierta pero el SL fallo tras varios reintentos: {e}. Se reintentara en el proximo ciclo.", level="error")
+                # no re-lanzamos: el proximo ciclo va a entrar por el chequeo de "sl_order_id is None" de arriba
+
+def reconciliar_estado_inicial():
+    """Al arrancar, si hay una posicion abierta en el exchange que el estado local
+    no conoce (por ejemplo, por un crash antes de guardar estado), la adopta en vez
+    de intentar abrir una posicion nueva y duplicar exposicion."""
+    global estado
+    qty_exchange = posicion_abierta(SYMBOL)
+    if qty_exchange != 0 and estado["position"] is None:
+        direccion = "LONG" if qty_exchange > 0 else "SHORT"
+        notify(f"Se detecto una posicion {direccion} existente en el exchange ({qty_exchange}) que el estado local no conocia. Adoptando.", level="warning")
+        estado["position"] = direccion
+        try:
+            precio_actual = obtener_precio_actual(SYMBOL)
+            estado["entry_price"] = precio_actual  # aproximado; no tenemos el entry real si no lo guardamos antes
+        except Exception:
+            pass
+        existente = buscar_stop_existente(SYMBOL)
+        if existente is not None:
+            estado["sl_order_id"] = existente["orderId"]
+            estado["sl_price"] = existente["stopPrice"]
+            notify(f"SL existente detectado y adoptado: {existente['stopPrice']}")
+        else:
+            estado["sl_order_id"] = None
+            notify("ALERTA: no se encontro SL para la posicion adoptada. Se intentara colocar uno en el proximo ciclo.", level="warning")
         guardar_estado(estado)
 
 def main():
     notify(f"Bot iniciado. Symbol={SYMBOL} Leverage={LEVERAGE}x DryRun={DRY_RUN} Testnet={USE_TESTNET}")
     con_reintentos(configurar_leverage, 6, 5, SYMBOL, LEVERAGE)
+    con_reintentos(reconciliar_estado_inicial, 6, 5)
     while True:
         try:
             ciclo()

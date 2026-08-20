@@ -137,16 +137,22 @@ def con_reintentos(func, max_intentos=6, espera_inicial=5, *args, **kwargs):
     """Ejecuta func con reintentos y espera progresiva (5s, 10s, 20s, 40s...).
     Evita que un fallo transitorio de la API (rate limit, red, etc.) crashee
     el contenedor y dispare un loop de reinicios de Railway, que a su vez
-    puede agravar un ban temporal de IP en Binance."""
+    puede agravar un ban temporal de IP en Binance.
+    Si max_intentos es None, reintenta INDEFINIDAMENTE (con techo de 5min entre
+    intentos) en vez de terminar en excepcion -- usar solo para llamadas de arranque
+    donde crashear el proceso seria peor que esperar mas tiempo."""
     espera = espera_inicial
-    for intento in range(1, max_intentos + 1):
+    intento = 0
+    while True:
+        intento += 1
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            if intento == max_intentos:
+            if max_intentos is not None and intento >= max_intentos:
                 log.error(f"Fallaron los {max_intentos} intentos de {func.__name__}: {e}")
                 raise
-            log.warning(f"Intento {intento}/{max_intentos} de {func.__name__} fallo ({e}). Reintentando en {espera}s...")
+            etiqueta = f"{intento}/{max_intentos}" if max_intentos is not None else f"{intento} (indefinido)"
+            log.warning(f"Intento {etiqueta} de {func.__name__} fallo ({e}). Reintentando en {espera}s...")
             time.sleep(espera)
             espera = min(espera * 2, 300)  # tope de 5 minutos entre reintentos
 
@@ -163,7 +169,7 @@ def obtener_filtros_simbolo(symbol):
             }
     raise ValueError(f"Simbolo {symbol} no encontrado")
 
-FILTROS = con_reintentos(obtener_filtros_simbolo, 6, 5, SYMBOL)
+FILTROS = con_reintentos(obtener_filtros_simbolo, None, 5, SYMBOL)
 
 def redondear_precio(price):
     tick = FILTROS["tick_size"]
@@ -497,11 +503,15 @@ def ciclo():
                 # no re-lanzamos: el proximo ciclo va a entrar por el chequeo de "sl_order_id is None" de arriba
 
 def reconciliar_estado_inicial():
-    """Al arrancar, si hay una posicion abierta en el exchange que el estado local
-    no conoce (por ejemplo, por un crash antes de guardar estado), la adopta en vez
-    de intentar abrir una posicion nueva y duplicar exposicion."""
+    """Al arrancar, reconcilia el estado local contra la realidad del exchange:
+    1. Si hay una posicion abierta que el estado local no conoce, la adopta.
+    2. Si NO hay posicion pero hay una orden condicional pendiente (de una reentrada
+       previa) que el estado local no conoce, tambien la adopta como "esperando
+       reentrada" -- evita que el bot abra una posicion nueva a mercado mientras esa
+       orden vieja sigue viva y podria dispararse mas tarde, duplicando exposicion."""
     global estado
     qty_exchange = posicion_abierta(SYMBOL)
+
     if qty_exchange != 0 and estado["position"] is None:
         direccion = "LONG" if qty_exchange > 0 else "SHORT"
         notify(f"Se detecto una posicion {direccion} existente en el exchange ({qty_exchange}) que el estado local no conocia. Adoptando.", level="warning")
@@ -520,11 +530,34 @@ def reconciliar_estado_inicial():
             estado["sl_order_id"] = None
             notify("ALERTA: no se encontro SL para la posicion adoptada. Se intentara colocar uno en el proximo ciclo.", level="warning")
         guardar_estado(estado)
+        return
+
+    if qty_exchange == 0 and estado["position"] is None and not estado["waiting_reentry"]:
+        # plano segun el exchange Y segun el estado local -- pero puede haber una orden
+        # de reentrada vieja todavia pendiente que el estado local no recuerda
+        pendiente = buscar_stop_existente(SYMBOL)
+        if pendiente is not None:
+            notify(f"Se detecto una orden pendiente en el exchange ({pendiente['triggerPrice']}) sin posicion asociada. Adoptando como espera de reentrada, en vez de abrir una posicion nueva a mercado.", level="warning")
+            estado["waiting_reentry"] = True
+            estado["reentry_order_id"] = pendiente["algoId"]
+            estado["reentry_price"] = pendiente["triggerPrice"]
+            # no sabemos con certeza la direccion original de esa orden vieja sin mas
+            # contexto -- la inferimos por el lado (BUY=LONG, SELL=SHORT) si esta disponible
+            estado["reentry_dirn"] = None  # se completa abajo si es posible
+            try:
+                ordenes = client.futures_get_open_algo_orders(symbol=SYMBOL)
+                lista = ordenes.get("orders", ordenes) if isinstance(ordenes, dict) else ordenes
+                for o in lista:
+                    if o.get("algoId") == pendiente["algoId"]:
+                        estado["reentry_dirn"] = "LONG" if o.get("side") == "BUY" else "SHORT"
+            except Exception:
+                pass
+            guardar_estado(estado)
 
 def main():
     notify(f"Bot iniciado. Symbol={SYMBOL} Leverage={LEVERAGE}x DryRun={DRY_RUN} Testnet={USE_TESTNET}")
-    con_reintentos(configurar_leverage, 6, 5, SYMBOL, LEVERAGE)
-    con_reintentos(reconciliar_estado_inicial, 6, 5)
+    con_reintentos(configurar_leverage, None, 5, SYMBOL, LEVERAGE)
+    con_reintentos(reconciliar_estado_inicial, None, 5)
     while True:
         try:
             ciclo()

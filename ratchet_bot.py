@@ -133,6 +133,23 @@ estado = cargar_estado()
 # INFO DEL SIMBOLO (precision de precio/cantidad)
 # ============================================================
 
+def con_reintentos(func, max_intentos=6, espera_inicial=5, *args, **kwargs):
+    """Ejecuta func con reintentos y espera progresiva (5s, 10s, 20s, 40s...).
+    Evita que un fallo transitorio de la API (rate limit, red, etc.) crashee
+    el contenedor y dispare un loop de reinicios de Railway, que a su vez
+    puede agravar un ban temporal de IP en Binance."""
+    espera = espera_inicial
+    for intento in range(1, max_intentos + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if intento == max_intentos:
+                log.error(f"Fallaron los {max_intentos} intentos de {func.__name__}: {e}")
+                raise
+            log.warning(f"Intento {intento}/{max_intentos} de {func.__name__} fallo ({e}). Reintentando en {espera}s...")
+            time.sleep(espera)
+            espera = min(espera * 2, 300)  # tope de 5 minutos entre reintentos
+
 def obtener_filtros_simbolo(symbol):
     info = client.futures_exchange_info()
     for s in info["symbols"]:
@@ -146,7 +163,7 @@ def obtener_filtros_simbolo(symbol):
             }
     raise ValueError(f"Simbolo {symbol} no encontrado")
 
-FILTROS = obtener_filtros_simbolo(SYMBOL)
+FILTROS = con_reintentos(obtener_filtros_simbolo, 6, 5, SYMBOL)
 
 def redondear_precio(price):
     tick = FILTROS["tick_size"]
@@ -410,13 +427,15 @@ def ciclo():
 
 def main():
     notify(f"Bot iniciado. Symbol={SYMBOL} Leverage={LEVERAGE}x DryRun={DRY_RUN} Testnet={USE_TESTNET}")
-    configurar_leverage(SYMBOL, LEVERAGE)
+    con_reintentos(configurar_leverage, 6, 5, SYMBOL, LEVERAGE)
     while True:
         try:
             ciclo()
         except Exception as e:
             log.exception(f"Error en el ciclo principal: {e}")
             notify(f"ERROR en el bot: {e}", level="error")
+            time.sleep(POLL_SECONDS * 4)  # ante un error, esperar mas antes de reintentar
+            continue
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":

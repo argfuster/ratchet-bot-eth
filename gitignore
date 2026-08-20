@@ -1,0 +1,5 @@
+.env
+ratchet_bot_state.json
+ratchet_bot.log
+__pycache__/
+*.pyc

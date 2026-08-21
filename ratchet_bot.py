@@ -152,7 +152,13 @@ def con_reintentos(func, max_intentos=6, espera_inicial=5, *args, **kwargs):
                 log.error(f"Fallaron los {max_intentos} intentos de {func.__name__}: {e}")
                 raise
             etiqueta = f"{intento}/{max_intentos}" if max_intentos is not None else f"{intento} (indefinido)"
-            log.warning(f"Intento {etiqueta} de {func.__name__} fallo ({e}). Reintentando en {espera}s...")
+            mensaje = f"Intento {etiqueta} de {func.__name__} fallo ({e}). Reintentando en {espera}s..."
+            if espera >= 300:
+                # ya llegamos al techo de espera -- avisar por Telegram cada tanto,
+                # sin spamear en los reintentos rapidos del principio
+                notify(mensaje, level="warning")
+            else:
+                log.warning(mensaje)
             time.sleep(espera)
             espera = min(espera * 2, 300)  # tope de 5 minutos entre reintentos
 
@@ -270,13 +276,27 @@ def abrir_posicion(symbol, direccion, precio_referencia):
     orden = client.futures_create_order(
         symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty
     )
-    notify(f"Posicion {direccion} abierta: {qty} {symbol} (orden {orden['orderId']})")
+    emoji = "🟢" if direccion == "LONG" else "🔴"
+    notify(f"{emoji} {direccion} abierto\nPrecio: {precio_referencia:.2f}\nCantidad: {qty} {symbol}")
     return orden
+
+class PosicionCerradaAMercado(Exception):
+    """Señal de que, al intentar colocar el SL, el precio ya habia cruzado el nivel
+    (Binance rechazo con -2021) y se cerro la posicion a mercado en su lugar."""
+    pass
 
 def colocar_sl(symbol, direccion, sl_price, qty):
     """Coloca un stop de cierre via la Algo Order API (obligatoria desde dic-2025 de
     Binance para todas las ordenes condicionales: STOP_MARKET, TAKE_PROFIT_MARKET, etc.
-    El endpoint viejo /fapi/v1/order ya NO acepta estos tipos de orden -- da error -4120."""
+    El endpoint viejo /fapi/v1/order ya NO acepta estos tipos de orden -- da error -4120.
+
+    Caso especial: si el precio ya cruzo el nivel de sl_price para el momento en que
+    la orden llega al exchange (por ejemplo, un movimiento muy rapido justo al arrancar
+    un periodo nuevo, antes de que el bot llegue a colocar el SL actualizado), Binance
+    puede rechazar la orden con -2021 "Order would immediately trigger" en vez de
+    ejecutarla. En ese caso, cerramos la posicion a mercado directamente y avisamos
+    con una excepcion especifica, para que el llamador actualice el estado como
+    corresponde (posicion cerrada), en vez de asumir que quedo un SL activo."""
     side = SIDE_SELL if direccion == "LONG" else SIDE_BUY
     sl_price = redondear_precio(sl_price)
 
@@ -284,12 +304,19 @@ def colocar_sl(symbol, direccion, sl_price, qty):
         log.info(f"[DRY_RUN] Colocaria SL algo-order {direccion} a {sl_price} ({qty} {symbol})")
         return {"algoId": f"dryrun_sl_{int(time.time())}"}
 
-    orden = client.futures_create_algo_order(
-        algoType="CONDITIONAL", symbol=symbol, side=side, type="STOP_MARKET",
-        triggerPrice=sl_price, closePosition="true",
-    )
-    notify(f"SL colocado ({direccion}) a {sl_price} [algoId={orden.get('algoId')}]")
-    return orden
+    try:
+        orden = client.futures_create_algo_order(
+            algoType="CONDITIONAL", symbol=symbol, side=side, type="STOP_MARKET",
+            triggerPrice=sl_price, closePosition="true",
+        )
+        notify(f"🛡️ SL colocado ({direccion})\nNivel: {sl_price:.2f}")
+        return orden
+    except BinanceAPIException as e:
+        if e.code == -2021:
+            notify(f"⚠️ El nivel de SL ({sl_price:.2f}) ya fue superado por el precio antes de poder colocarlo. Cerrando la posicion a mercado.", level="warning")
+            client.futures_create_order(symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty)
+            raise PosicionCerradaAMercado(f"Posicion cerrada a mercado, el nivel {sl_price} ya estaba superado")
+        raise
 
 def colocar_orden_reentrada(symbol, direccion, nivel_precio):
     """Coloca un stop de apertura (algo order) que dispara una posicion nueva al tocar
@@ -307,7 +334,7 @@ def colocar_orden_reentrada(symbol, direccion, nivel_precio):
         algoType="CONDITIONAL", symbol=symbol, side=side, type="STOP_MARKET",
         triggerPrice=nivel_precio, quantity=qty,
     )
-    notify(f"Orden de reentrada colocada ({direccion}) a {nivel_precio} [algoId={orden.get('algoId')}]")
+    notify(f"⏳ Orden de reentrada colocada ({direccion})\nNivel: {nivel_precio:.2f}")
     return orden
 
 def cancelar_orden(symbol, algo_id):
@@ -373,6 +400,17 @@ def periodo_actual_ms():
     inicio = now.replace(hour=hora_redondeada, minute=0, second=0, microsecond=0)
     return int(inicio.timestamp() * 1000)
 
+def colocar_sl_seguro(symbol, direccion, sl_price, qty):
+    """Wrapper robusto: antes de colocar el SL, chequea en el exchange (no solo en el
+    estado local) si ya existe uno activo, y lo cancela primero si es asi. Evita el
+    error -4130 (orden duplicada) cuando una cancelacion anterior fallo silenciosamente
+    o hubo un delay de propagacion entre cancelar y crear."""
+    existente = buscar_stop_existente(symbol)
+    if existente is not None:
+        con_reintentos(cancelar_orden, 5, 2, symbol, existente["algoId"])
+        time.sleep(1)  # pequeño margen para que el exchange propague la cancelacion
+    return colocar_sl(symbol, direccion, sl_price, qty)
+
 def ciclo():
     global estado
     velas = obtener_klines_4h(SYMBOL, limit=300)
@@ -392,34 +430,37 @@ def ciclo():
             # antes de crear uno nuevo y duplicarlo
             existente = buscar_stop_existente(SYMBOL)
             if existente is not None:
-                notify(f"Se encontro un SL ya existente en el exchange (colocado manualmente u otro origen) a {existente['triggerPrice']}. Adoptando ese, sin crear uno nuevo.")
+                notify(f"🛡️ SL existente detectado en el exchange (manual u otro origen)\nNivel: {existente['triggerPrice']:.2f}\nAdoptado, sin crear uno nuevo.")
                 estado["sl_order_id"] = existente["algoId"]
                 estado["sl_price"] = existente["triggerPrice"]
                 estado["current_period_open_time"] = periodo_ms
                 guardar_estado(estado)
                 return
 
-            notify(f"ALERTA: posicion {estado['position']} sin SL colocado. Reintentando colocar SL de emergencia...", level="warning")
+            notify(f"⚠️ ALERTA: posicion {estado['position']} sin SL colocado. Reintentando colocar SL de emergencia...", level="warning")
             try:
                 qty = abs(posicion_abierta(SYMBOL))
                 if qty > 0:
-                    orden_sl = con_reintentos(colocar_sl, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
+                    orden_sl = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
                     estado["sl_order_id"] = orden_sl["algoId"]
                     estado["sl_price"] = sl_price_calc
                     estado["current_period_open_time"] = periodo_ms
                     guardar_estado(estado)
-                    notify(f"SL de emergencia colocado correctamente a {sl_price_calc}")
+                    notify(f"✅ SL de emergencia colocado correctamente\nNivel: {sl_price_calc:.2f}")
                 else:
                     notify("La posicion ya no existe en el exchange (se debe haber cerrado manualmente). Reseteando estado.", level="warning")
                     estado = estado_default()
                     guardar_estado(estado)
             except Exception as e:
-                notify(f"CRITICO: no se pudo colocar el SL de emergencia tras varios reintentos: {e}. Requiere intervencion manual inmediata.", level="error")
+                notify(f"🚨 CRITICO: no se pudo colocar el SL de emergencia tras varios reintentos: {e}. Requiere intervencion manual inmediata.", level="error")
             return
 
         # chequear si el SL se ejecuto (via el tamaño real de la posicion, no el status de la orden)
         if sl_fue_tocado(SYMBOL, estado["position"]):
-            notify(f"SL tocado en {estado['position']} @ {estado['sl_price']}. Pasando a espera de reentrada.")
+            dirn_num = 1 if estado["position"] == "LONG" else -1
+            pct = ((estado["sl_price"]/estado["entry_price"]) - 1) * 100 * dirn_num if estado["entry_price"] else None
+            pct_str = f"{pct:+.2f}%" if pct is not None else "N/D"
+            notify(f"🔴 SL tocado - posicion cerrada\n{estado['position']} cerrado en {estado['sl_price']:.2f}\nResultado: {pct_str}\nEsperando reentrada...")
             estado["waiting_reentry"] = True
             estado["reentry_dirn"] = estado["position"]
             estado["reentry_price"] = estado["sl_price"]
@@ -436,20 +477,21 @@ def ciclo():
 
         # si arranca un nuevo periodo de 4h, recalcular y reemplazar el SL
         if nuevo_periodo and sl_price_calc is not None and direccion_regimen == estado["position"]:
-            cancelar_orden(SYMBOL, estado["sl_order_id"])
+            sl_anterior = estado["sl_price"]
             qty = abs(posicion_abierta(SYMBOL))
-            orden = con_reintentos(colocar_sl, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
+            orden = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
             estado["sl_order_id"] = orden["algoId"]
             estado["sl_price"] = sl_price_calc
             estado["current_period_open_time"] = periodo_ms
             guardar_estado(estado)
-            notify(f"SL actualizado para nuevo periodo de 4h: {sl_price_calc}")
+            notify(f"🔄 SL actualizado (nuevo periodo 4h)\n{sl_anterior:.2f} → {sl_price_calc:.2f}")
         return
 
     # --- Caso 2: esperando reentrada ---
     if estado["waiting_reentry"]:
         if reentrada_fue_tocada(SYMBOL, estado["reentry_dirn"]):
-            notify(f"Reentrada ejecutada: {estado['reentry_dirn']} @ {estado['reentry_price']}")
+            emoji = "🟢" if estado["reentry_dirn"] == "LONG" else "🔴"
+            notify(f"{emoji} Reentrada ejecutada\n{estado['reentry_dirn']} @ {estado['reentry_price']:.2f}")
             estado["position"] = estado["reentry_dirn"]
             estado["entry_price"] = estado["reentry_price"]
             estado["waiting_reentry"] = False
@@ -460,20 +502,20 @@ def ciclo():
             if sl_price_calc is not None:
                 try:
                     qty = abs(posicion_abierta(SYMBOL))
-                    orden = con_reintentos(colocar_sl, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
+                    orden = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
                     estado["sl_order_id"] = orden["algoId"]
                     estado["sl_price"] = sl_price_calc
                     estado["current_period_open_time"] = periodo_ms
                     guardar_estado(estado)
                 except Exception as e:
-                    notify(f"ALERTA: reentrada ejecutada pero el SL fallo: {e}. Se reintentara el proximo ciclo.", level="error")
+                    notify(f"⚠️ ALERTA: reentrada ejecutada pero el SL fallo: {e}. Se reintentara el proximo ciclo.", level="error")
             return
 
         # si el regimen cambio de direccion mientras esperabamos, cancelar la espera
         # y abrir directamente en la nueva direccion
         if direccion_regimen is not None and direccion_regimen != estado["reentry_dirn"]:
-            notify(f"Regimen cambio de {estado['reentry_dirn']} a {direccion_regimen} mientras se esperaba reentrada. Cancelando espera y abriendo en la nueva direccion.")
-            cancelar_orden(SYMBOL, estado["reentry_order_id"])
+            notify(f"🔀 Regimen cambio: {estado['reentry_dirn']} → {direccion_regimen}\nCancelando espera de reentrada, abriendo en la nueva direccion.")
+            con_reintentos(cancelar_orden, 5, 2, SYMBOL, estado["reentry_order_id"])
             estado["waiting_reentry"] = False
             estado["reentry_order_id"] = None
             guardar_estado(estado)
@@ -489,17 +531,17 @@ def ciclo():
         estado["sl_order_id"] = None  # todavia no colocado -- se guarda YA asi el proximo ciclo lo detecta si algo falla abajo
         estado["current_period_open_time"] = periodo_ms
         guardar_estado(estado)
-        notify(f"Posicion abierta, guardando estado antes de intentar el SL...")
+        notify(f"💾 Posicion abierta, guardando estado antes de intentar el SL...")
 
         if sl_price_calc is not None:
             try:
                 qty = abs(posicion_abierta(SYMBOL)) if not DRY_RUN else float(orden_entrada.get("executedQty", 0))
-                orden_sl = con_reintentos(colocar_sl, 8, 3, SYMBOL, direccion_regimen, sl_price_calc, qty)
+                orden_sl = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, direccion_regimen, sl_price_calc, qty)
                 estado["sl_order_id"] = orden_sl["algoId"]
                 estado["sl_price"] = sl_price_calc
                 guardar_estado(estado)
             except Exception as e:
-                notify(f"ALERTA: posicion abierta pero el SL fallo tras varios reintentos: {e}. Se reintentara en el proximo ciclo.", level="error")
+                notify(f"⚠️ ALERTA: posicion abierta pero el SL fallo tras varios reintentos: {e}. Se reintentara en el proximo ciclo.", level="error")
                 # no re-lanzamos: el proximo ciclo va a entrar por el chequeo de "sl_order_id is None" de arriba
 
 def reconciliar_estado_inicial():
@@ -514,7 +556,7 @@ def reconciliar_estado_inicial():
 
     if qty_exchange != 0 and estado["position"] is None:
         direccion = "LONG" if qty_exchange > 0 else "SHORT"
-        notify(f"Se detecto una posicion {direccion} existente en el exchange ({qty_exchange}) que el estado local no conocia. Adoptando.", level="warning")
+        notify(f"🔍 Posicion {direccion} existente detectada en el exchange ({qty_exchange})\nEl estado local no la conocia -- adoptando.", level="warning")
         estado["position"] = direccion
         try:
             precio_actual = obtener_precio_actual(SYMBOL)
@@ -525,7 +567,7 @@ def reconciliar_estado_inicial():
         if existente is not None:
             estado["sl_order_id"] = existente["algoId"]
             estado["sl_price"] = existente["triggerPrice"]
-            notify(f"SL existente detectado y adoptado: {existente['triggerPrice']}")
+            notify(f"🛡️ SL existente detectado y adoptado\nNivel: {existente['triggerPrice']:.2f}")
         else:
             estado["sl_order_id"] = None
             notify("ALERTA: no se encontro SL para la posicion adoptada. Se intentara colocar uno en el proximo ciclo.", level="warning")
@@ -537,7 +579,7 @@ def reconciliar_estado_inicial():
         # de reentrada vieja todavia pendiente que el estado local no recuerda
         pendiente = buscar_stop_existente(SYMBOL)
         if pendiente is not None:
-            notify(f"Se detecto una orden pendiente en el exchange ({pendiente['triggerPrice']}) sin posicion asociada. Adoptando como espera de reentrada, en vez de abrir una posicion nueva a mercado.", level="warning")
+            notify(f"🔍 Orden pendiente detectada en el exchange (nivel {pendiente['triggerPrice']:.2f}) sin posicion asociada.\nAdoptando como espera de reentrada, en vez de abrir una posicion nueva a mercado.", level="warning")
             estado["waiting_reentry"] = True
             estado["reentry_order_id"] = pendiente["algoId"]
             estado["reentry_price"] = pendiente["triggerPrice"]
@@ -555,7 +597,8 @@ def reconciliar_estado_inicial():
             guardar_estado(estado)
 
 def main():
-    notify(f"Bot iniciado. Symbol={SYMBOL} Leverage={LEVERAGE}x DryRun={DRY_RUN} Testnet={USE_TESTNET}")
+    modo = "🧪 DRY RUN (simulacion)" if DRY_RUN else "💰 CUENTA REAL"
+    notify(f"🤖 Bot iniciado\nSymbol: {SYMBOL} | Leverage: {LEVERAGE}x\nModo: {modo}")
     con_reintentos(configurar_leverage, None, 5, SYMBOL, LEVERAGE)
     con_reintentos(reconciliar_estado_inicial, None, 5)
     while True:
@@ -563,7 +606,7 @@ def main():
             ciclo()
         except Exception as e:
             log.exception(f"Error en el ciclo principal: {e}")
-            notify(f"ERROR en el bot: {e}", level="error")
+            notify(f"🚨 ERROR en el bot: {e}", level="error")
             time.sleep(POLL_SECONDS * 4)  # ante un error, esperar mas antes de reintentar
             continue
         time.sleep(POLL_SECONDS)

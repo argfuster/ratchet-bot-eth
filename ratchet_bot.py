@@ -53,6 +53,7 @@ LEVERAGE = int(os.environ.get("LEVERAGE", "3"))          # techo recomendado: 5x
 POSITION_PCT_CAPITAL = float(os.environ.get("POSITION_PCT_CAPITAL", "0.95"))  # % del capital disponible a usar
 EMA_SPAN = int(os.environ.get("EMA_SPAN", "50"))
 SL_FRACTION = float(os.environ.get("SL_FRACTION", "0.5"))  # 50% del rango del período anterior
+SL_MIN_PCT = float(os.environ.get("SL_MIN_PCT", "0.25"))  # piso minimo de distancia del SL respecto al precio de entrada
 KLINE_INTERVAL = "4h"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 
@@ -133,20 +134,25 @@ estado = cargar_estado()
 # INFO DEL SIMBOLO (precision de precio/cantidad)
 # ============================================================
 
-def con_reintentos(func, max_intentos=6, espera_inicial=5, *args, **kwargs):
+def con_reintentos(func, max_intentos=6, espera_inicial=5, *args, no_reintentar=(), **kwargs):
     """Ejecuta func con reintentos y espera progresiva (5s, 10s, 20s, 40s...).
     Evita que un fallo transitorio de la API (rate limit, red, etc.) crashee
     el contenedor y dispare un loop de reinicios de Railway, que a su vez
     puede agravar un ban temporal de IP en Binance.
     Si max_intentos es None, reintenta INDEFINIDAMENTE (con techo de 5min entre
     intentos) en vez de terminar en excepcion -- usar solo para llamadas de arranque
-    donde crashear el proceso seria peor que esperar mas tiempo."""
+    donde crashear el proceso seria peor que esperar mas tiempo.
+    no_reintentar: tupla de tipos de excepcion que se relanzan de inmediato, SIN
+    reintentar -- para errores donde reintentar la misma accion no tiene sentido
+    (por ejemplo, colocar un SL que ya sabemos invalido porque la posicion se cerro)."""
     espera = espera_inicial
     intento = 0
     while True:
         intento += 1
         try:
             return func(*args, **kwargs)
+        except no_reintentar:
+            raise
         except Exception as e:
             if max_intentos is not None and intento >= max_intentos:
                 log.error(f"Fallaron los {max_intentos} intentos de {func.__name__}: {e}")
@@ -236,6 +242,22 @@ def calcular_regimen_y_sl(velas):
         sl_price = None
 
     return regimen, sl_price, vela_actual, vela_anterior
+
+def aplicar_piso_sl(sl_price, entry_price, direccion):
+    """Si la distancia entre el SL natural y el precio de entrada real es menor al
+    piso minimo (SL_MIN_PCT), la reemplaza por esa distancia minima. Protege contra
+    el caso donde una reentrada ocurre muy cerca del cierre de un periodo de 4h,
+    dejando el SL natural practicamente pegado al precio de entrada (visto en vivo
+    el 22-ago-2026: genero una cascada de ~22 aperturas/cierres en 3 horas)."""
+    if entry_price is None or entry_price == 0:
+        return sl_price
+    dist_pct = abs(sl_price - entry_price) / entry_price * 100
+    if dist_pct < SL_MIN_PCT:
+        if direccion == "LONG":
+            return entry_price * (1 - SL_MIN_PCT/100)
+        else:
+            return entry_price * (1 + SL_MIN_PCT/100)
+    return sl_price
 
 # ============================================================
 # EJECUCION DE ORDENES
@@ -411,6 +433,47 @@ def colocar_sl_seguro(symbol, direccion, sl_price, qty):
         time.sleep(1)  # pequeño margen para que el exchange propague la cancelacion
     return colocar_sl(symbol, direccion, sl_price, qty)
 
+def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
+    """Intenta colocar el SL con reintentos normales. Si el nivel calculado ya estaba
+    superado por el precio (PosicionCerradaAMercado -- la posicion se cerro de
+    emergencia), NO reintenta colocar ese mismo SL invalido: en cambio, transiciona
+    el estado a 'esperando reentrada', exactamente igual que un SL tocado normal.
+    Esto corta el loop de apertura/cierre repetido que puede darse cuando una
+    reentrada ocurre muy cerca del cierre de un periodo de 4h (el SL recalculado
+    para el periodo actual puede terminar practicamente pegado al precio de entrada).
+    Devuelve True si coloco el SL con exito, False si transiciono a espera de reentrada."""
+    global estado
+    qty = abs(posicion_abierta(SYMBOL))
+    if qty == 0:
+        notify("La posicion ya no existe en el exchange. Reseteando estado.", level="warning")
+        estado = estado_default()
+        guardar_estado(estado)
+        return False
+
+    sl_price_original = sl_price_calc
+    sl_price_calc = aplicar_piso_sl(sl_price_calc, estado.get("entry_price"), direccion)
+    if sl_price_calc != sl_price_original:
+        log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}%)")
+
+    try:
+        orden = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, direccion, sl_price_calc, qty,
+                                no_reintentar=(PosicionCerradaAMercado,))
+        estado["sl_order_id"] = orden["algoId"]
+        estado["sl_price"] = sl_price_calc
+        estado["current_period_open_time"] = periodo_ms
+        guardar_estado(estado)
+        return True
+    except PosicionCerradaAMercado:
+        notify(f"🔴 Posicion cerrada de emergencia (SL calculado invalido para este punto del periodo)\nPasando a espera de reentrada en {sl_price_calc:.2f}", level="warning")
+        estado["waiting_reentry"] = True
+        estado["reentry_dirn"] = direccion
+        estado["reentry_price"] = sl_price_calc
+        estado["position"] = None
+        estado["entry_price"] = None
+        estado["sl_order_id"] = None
+        guardar_estado(estado)
+        return False
+
 def ciclo():
     global estado
     velas = obtener_klines_4h(SYMBOL, limit=300)
@@ -439,18 +502,8 @@ def ciclo():
 
             notify(f"⚠️ ALERTA: posicion {estado['position']} sin SL colocado. Reintentando colocar SL de emergencia...", level="warning")
             try:
-                qty = abs(posicion_abierta(SYMBOL))
-                if qty > 0:
-                    orden_sl = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
-                    estado["sl_order_id"] = orden_sl["algoId"]
-                    estado["sl_price"] = sl_price_calc
-                    estado["current_period_open_time"] = periodo_ms
-                    guardar_estado(estado)
+                if colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms):
                     notify(f"✅ SL de emergencia colocado correctamente\nNivel: {sl_price_calc:.2f}")
-                else:
-                    notify("La posicion ya no existe en el exchange (se debe haber cerrado manualmente). Reseteando estado.", level="warning")
-                    estado = estado_default()
-                    guardar_estado(estado)
             except Exception as e:
                 notify(f"🚨 CRITICO: no se pudo colocar el SL de emergencia tras varios reintentos: {e}. Requiere intervencion manual inmediata.", level="error")
             return
@@ -478,13 +531,8 @@ def ciclo():
         # si arranca un nuevo periodo de 4h, recalcular y reemplazar el SL
         if nuevo_periodo and sl_price_calc is not None and direccion_regimen == estado["position"]:
             sl_anterior = estado["sl_price"]
-            qty = abs(posicion_abierta(SYMBOL))
-            orden = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
-            estado["sl_order_id"] = orden["algoId"]
-            estado["sl_price"] = sl_price_calc
-            estado["current_period_open_time"] = periodo_ms
-            guardar_estado(estado)
-            notify(f"🔄 SL actualizado (nuevo periodo 4h)\n{sl_anterior:.2f} → {sl_price_calc:.2f}")
+            if colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms):
+                notify(f"🔄 SL actualizado (nuevo periodo 4h)\n{sl_anterior:.2f} → {sl_price_calc:.2f}")
         return
 
     # --- Caso 2: esperando reentrada ---
@@ -501,12 +549,7 @@ def ciclo():
             # colocar el SL del periodo actual
             if sl_price_calc is not None:
                 try:
-                    qty = abs(posicion_abierta(SYMBOL))
-                    orden = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, estado["position"], sl_price_calc, qty)
-                    estado["sl_order_id"] = orden["algoId"]
-                    estado["sl_price"] = sl_price_calc
-                    estado["current_period_open_time"] = periodo_ms
-                    guardar_estado(estado)
+                    colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms)
                 except Exception as e:
                     notify(f"⚠️ ALERTA: reentrada ejecutada pero el SL fallo: {e}. Se reintentara el proximo ciclo.", level="error")
             return
@@ -535,11 +578,7 @@ def ciclo():
 
         if sl_price_calc is not None:
             try:
-                qty = abs(posicion_abierta(SYMBOL)) if not DRY_RUN else float(orden_entrada.get("executedQty", 0))
-                orden_sl = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, direccion_regimen, sl_price_calc, qty)
-                estado["sl_order_id"] = orden_sl["algoId"]
-                estado["sl_price"] = sl_price_calc
-                guardar_estado(estado)
+                colocar_sl_o_pasar_a_espera(direccion_regimen, sl_price_calc, periodo_ms)
             except Exception as e:
                 notify(f"⚠️ ALERTA: posicion abierta pero el SL fallo tras varios reintentos: {e}. Se reintentara en el proximo ciclo.", level="error")
                 # no re-lanzamos: el proximo ciclo va a entrar por el chequeo de "sl_order_id is None" de arriba

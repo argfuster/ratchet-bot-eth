@@ -307,6 +307,15 @@ class PosicionCerradaAMercado(Exception):
     (Binance rechazo con -2021) y se cerro la posicion a mercado en su lugar."""
     pass
 
+class ReentradaYaDisparada(Exception):
+    """Señal de que, al intentar colocar la orden PENDIENTE de reentrada, el precio ya
+    habia superado ese nivel (Binance rechazo con -2021 la orden condicional) -- en ese
+    caso, se abrio la posicion a MERCADO directamente en su lugar (el toque, en terminos
+    de precio, ya ocurrio; solo faltaba que el bot lo reconociera)."""
+    def __init__(self, msg, orden_mercado):
+        super().__init__(msg)
+        self.orden_mercado = orden_mercado
+
 def colocar_sl(symbol, direccion, sl_price, qty):
     """Coloca un stop de cierre via la Algo Order API (obligatoria desde dic-2025 de
     Binance para todas las ordenes condicionales: STOP_MARKET, TAKE_PROFIT_MARKET, etc.
@@ -342,7 +351,14 @@ def colocar_sl(symbol, direccion, sl_price, qty):
 
 def colocar_orden_reentrada(symbol, direccion, nivel_precio):
     """Coloca un stop de apertura (algo order) que dispara una posicion nueva al tocar
-    el nivel donde se toco el SL anterior — replica la reentrada por toque del backtest."""
+    el nivel donde se toco el SL anterior — replica la reentrada por toque del backtest.
+
+    Caso especial: si el precio ya supero ese nivel para el momento en que la orden
+    llega al exchange (rebote muy rapido), Binance rechaza con -2021. En ese caso, el
+    toque ya ocurrio en terminos de precio -- abrimos la posicion a MERCADO directamente
+    y avisamos con una excepcion especifica, en vez de insistir con una orden pendiente
+    que ya no tiene sentido (visto en vivo el 22-ago-2026: reintentar esto a ciegas
+    crasheo el ciclo tras 6 intentos fallidos)."""
     side = SIDE_BUY if direccion == "LONG" else SIDE_SELL
     nivel_precio = redondear_precio(nivel_precio)
     precio_actual = obtener_precio_actual(symbol)
@@ -352,12 +368,19 @@ def colocar_orden_reentrada(symbol, direccion, nivel_precio):
         log.info(f"[DRY_RUN] Colocaria orden de reentrada algo-order {direccion} a {nivel_precio}")
         return {"algoId": f"dryrun_reentry_{int(time.time())}"}
 
-    orden = client.futures_create_algo_order(
-        algoType="CONDITIONAL", symbol=symbol, side=side, type="STOP_MARKET",
-        triggerPrice=nivel_precio, quantity=qty,
-    )
-    notify(f"⏳ Orden de reentrada colocada ({direccion})\nNivel: {nivel_precio:.2f}")
-    return orden
+    try:
+        orden = client.futures_create_algo_order(
+            algoType="CONDITIONAL", symbol=symbol, side=side, type="STOP_MARKET",
+            triggerPrice=nivel_precio, quantity=qty,
+        )
+        notify(f"⏳ Orden de reentrada colocada ({direccion})\nNivel: {nivel_precio:.2f}")
+        return orden
+    except BinanceAPIException as e:
+        if e.code == -2021:
+            notify(f"⚡ El nivel de reentrada ({nivel_precio:.2f}) ya fue superado por el precio. Abriendo a mercado directamente.", level="warning")
+            orden_mercado = client.futures_create_order(symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty)
+            raise ReentradaYaDisparada(f"Reentrada abierta a mercado, el nivel {nivel_precio} ya estaba superado", orden_mercado)
+        raise
 
 def cancelar_orden(symbol, algo_id):
     if algo_id is None or (isinstance(algo_id, str) and algo_id.startswith("dryrun")):
@@ -523,9 +546,25 @@ def ciclo():
             guardar_estado(estado)
             # colocar orden de reentrada inmediatamente si el regimen sigue favoreciendo esa direccion
             if direccion_regimen == estado["reentry_dirn"]:
-                orden = con_reintentos(colocar_orden_reentrada, 6, 3, SYMBOL, estado["reentry_dirn"], estado["reentry_price"])
-                estado["reentry_order_id"] = orden["algoId"]
-                guardar_estado(estado)
+                try:
+                    orden = con_reintentos(colocar_orden_reentrada, 6, 3, SYMBOL, estado["reentry_dirn"], estado["reentry_price"],
+                                            no_reintentar=(ReentradaYaDisparada,))
+                    estado["reentry_order_id"] = orden["algoId"]
+                    guardar_estado(estado)
+                except ReentradaYaDisparada as e:
+                    # el toque ya ocurrio en precio -- la posicion se abrio a mercado dentro de colocar_orden_reentrada
+                    notify(f"🟢 Reentrada ejecutada (a mercado, nivel ya superado)\n{estado['reentry_dirn']} @ ~{estado['reentry_price']:.2f}")
+                    estado["position"] = estado["reentry_dirn"]
+                    estado["entry_price"] = float(e.orden_mercado.get("avgPrice") or 0) or obtener_precio_actual(SYMBOL)
+                    estado["waiting_reentry"] = False
+                    estado["reentry_order_id"] = None
+                    estado["sl_order_id"] = None
+                    guardar_estado(estado)
+                    if sl_price_calc is not None:
+                        try:
+                            colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms)
+                        except Exception as e2:
+                            notify(f"⚠️ ALERTA: reentrada a mercado ejecutada pero el SL fallo: {e2}. Se reintentara el proximo ciclo.", level="error")
             return
 
         # si arranca un nuevo periodo de 4h, recalcular y reemplazar el SL
@@ -610,6 +649,7 @@ def reconciliar_estado_inicial():
         else:
             estado["sl_order_id"] = None
             notify("ALERTA: no se encontro SL para la posicion adoptada. Se intentara colocar uno en el proximo ciclo.", level="warning")
+        estado["current_period_open_time"] = periodo_actual_ms()  # evita que el proximo ciclo crea que "cambio de periodo" y recalcule el SL sin necesidad
         guardar_estado(estado)
         return
 

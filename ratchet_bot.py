@@ -478,6 +478,18 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
     if sl_price_calc != sl_price_original:
         log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}%)")
 
+    # Ratchet estricto: el SL nunca retrocede respecto al nivel ya vigente -- solo puede
+    # mejorar (subir en largo, bajar en corto). Validado contra 2024+/2025/2026: mejora
+    # z-score y acumulado en la muestra grande, neutro en la mas chica, nunca empeora.
+    sl_previo = estado.get("sl_price")
+    if sl_previo is not None:
+        if direccion == "LONG" and sl_previo > sl_price_calc:
+            log.info(f"Ratchet: manteniendo SL previo ({sl_previo:.2f}) en vez de retroceder a {sl_price_calc:.2f}")
+            sl_price_calc = sl_previo
+        elif direccion == "SHORT" and sl_previo < sl_price_calc:
+            log.info(f"Ratchet: manteniendo SL previo ({sl_previo:.2f}) en vez de retroceder a {sl_price_calc:.2f}")
+            sl_price_calc = sl_previo
+
     try:
         orden = con_reintentos(colocar_sl_seguro, 8, 3, SYMBOL, direccion, sl_price_calc, qty,
                                 no_reintentar=(PosicionCerradaAMercado,))
@@ -559,6 +571,7 @@ def ciclo():
                     estado["waiting_reentry"] = False
                     estado["reentry_order_id"] = None
                     estado["sl_order_id"] = None
+                    estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
                     guardar_estado(estado)
                     if sl_price_calc is not None:
                         try:
@@ -576,6 +589,35 @@ def ciclo():
 
     # --- Caso 2: esperando reentrada ---
     if estado["waiting_reentry"]:
+        # PRIORIDAD: si estamos esperando reentrada pero no hay ninguna orden pendiente
+        # activa (por ejemplo, porque la colocacion fallo y crasheo el ciclo antes de
+        # guardar el order_id -- visto en vivo el 22-ago-2026), reintentar colocarla
+        # antes de cualquier otra cosa. Sin esto, el bot queda esperando en silencio
+        # para siempre, sin ninguna orden que pueda dispararse.
+        if estado["reentry_order_id"] is None and direccion_regimen == estado["reentry_dirn"]:
+            try:
+                orden = con_reintentos(colocar_orden_reentrada, 6, 3, SYMBOL, estado["reentry_dirn"], estado["reentry_price"],
+                                        no_reintentar=(ReentradaYaDisparada,))
+                estado["reentry_order_id"] = orden["algoId"]
+                guardar_estado(estado)
+            except ReentradaYaDisparada as e:
+                notify(f"🟢 Reentrada ejecutada (a mercado, nivel ya superado)\n{estado['reentry_dirn']} @ ~{estado['reentry_price']:.2f}")
+                estado["position"] = estado["reentry_dirn"]
+                estado["entry_price"] = float(e.orden_mercado.get("avgPrice") or 0) or obtener_precio_actual(SYMBOL)
+                estado["waiting_reentry"] = False
+                estado["reentry_order_id"] = None
+                estado["sl_order_id"] = None
+                estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
+                guardar_estado(estado)
+                if sl_price_calc is not None:
+                    try:
+                        colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms)
+                    except Exception as e2:
+                        notify(f"⚠️ ALERTA: reentrada a mercado ejecutada pero el SL fallo: {e2}. Se reintentara el proximo ciclo.", level="error")
+            except Exception as e:
+                notify(f"⚠️ ALERTA: no se pudo colocar la orden de reentrada tras varios intentos: {e}. Se reintentara el proximo ciclo.", level="error")
+            return
+
         if reentrada_fue_tocada(SYMBOL, estado["reentry_dirn"]):
             emoji = "🟢" if estado["reentry_dirn"] == "LONG" else "🔴"
             notify(f"{emoji} Reentrada ejecutada\n{estado['reentry_dirn']} @ {estado['reentry_price']:.2f}")
@@ -584,6 +626,7 @@ def ciclo():
             estado["waiting_reentry"] = False
             estado["reentry_order_id"] = None
             estado["sl_order_id"] = None
+            estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
             guardar_estado(estado)  # guardar YA, antes de intentar el SL, por la misma razon que en Caso 3
             # colocar el SL del periodo actual
             if sl_price_calc is not None:
@@ -611,6 +654,7 @@ def ciclo():
         estado["position"] = direccion_regimen
         estado["entry_price"] = float(orden_entrada.get("avgPrice", precio_actual)) or precio_actual
         estado["sl_order_id"] = None  # todavia no colocado -- se guarda YA asi el proximo ciclo lo detecta si algo falla abajo
+        estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
         estado["current_period_open_time"] = periodo_ms
         guardar_estado(estado)
         notify(f"💾 Posicion abierta, guardando estado antes de intentar el SL...")

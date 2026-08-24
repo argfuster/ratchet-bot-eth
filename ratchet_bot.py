@@ -816,7 +816,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🤖 Ratchet Bot EMA{EMA_SPAN} (4h) {env}\n\n"
         f"Par: {SYMBOL} · Lev: {LEVERAGE}x · SL={int(SL_FRACTION*100)}% del rango previo · Piso={SL_MIN_PCT}%\n\n"
-        f"/status /close /balance /help"
+        f"/status /close /reset /balance /help"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -824,6 +824,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/start   — info del bot\n"
         "/status  — posición o espera activa\n"
         "/close   — cerrar posición manualmente\n"
+        "/reset   — resetear estado (tras un cierre manual, evita reentradas fantasma)\n"
         "/balance — balance USDT\n"
         "/help    — esta ayuda"
     )
@@ -900,6 +901,50 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         await update.message.reply_text(f"❌ Error consultando balance: {e}")
 
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resetea el estado del bot a 'plano', cancelando cualquier orden pendiente
+    (SL o reentrada) que pudiera quedar viva en el exchange. Rechaza el reset si
+    todavia hay una posicion REAL abierta -- resetear el estado sin cerrarla dejaria
+    esa posicion sin ningun SL gestionado por el bot."""
+    global estado
+    with estado_lock:
+        try:
+            qty = posicion_abierta(SYMBOL)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error consultando el exchange: {e}")
+            return
+        if qty != 0:
+            await update.message.reply_text(
+                f"⚠️ Todavia hay una posicion real abierta ({qty} {SYMBOL}) en el exchange.\n"
+                f"Usa /close primero para cerrarla -- resetear el estado ahora la dejaria sin SL gestionado."
+            )
+            return
+
+        canceladas = []
+        for campo in ("sl_order_id", "reentry_order_id"):
+            oid = estado.get(campo)
+            if oid:
+                try:
+                    con_reintentos(cancelar_orden, 3, 2, SYMBOL, oid)
+                    canceladas.append(oid)
+                except Exception as e:
+                    log.warning(f"No se pudo cancelar orden {oid} durante /reset: {e}")
+        # tambien barrer cualquier orden condicional que haya quedado suelta sin registrar en el estado
+        try:
+            suelta = buscar_stop_existente(SYMBOL)
+            if suelta is not None:
+                con_reintentos(cancelar_orden, 3, 2, SYMBOL, suelta["algoId"])
+                canceladas.append(suelta["algoId"])
+        except Exception as e:
+            log.warning(f"No se pudo verificar/cancelar ordenes sueltas durante /reset: {e}")
+
+        estado = estado_default()
+        guardar_estado(estado)
+        detalle = f" ({len(canceladas)} orden(es) pendiente(s) cancelada(s))" if canceladas else ""
+        await update.message.reply_text(
+            f"🔄 Estado reseteado -- el bot vuelve a evaluar el régimen desde cero en el próximo ciclo.{detalle}"
+        )
+
 def iniciar_telegram_listener():
     """Corre el listener de comandos de Telegram en su propio hilo y su propio event
     loop, en paralelo al loop de trading principal (que sigue siendo sincronico)."""
@@ -915,6 +960,7 @@ def iniciar_telegram_listener():
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("status", cmd_status))
         app.add_handler(CommandHandler("close", cmd_close))
+        app.add_handler(CommandHandler("reset", cmd_reset))
         app.add_handler(CommandHandler("balance", cmd_balance))
         log.info("Listener de comandos de Telegram iniciado.")
         app.run_polling(drop_pending_updates=True, close_loop=False, stop_signals=None)

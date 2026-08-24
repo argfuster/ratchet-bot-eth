@@ -25,6 +25,8 @@ import time
 import json
 import logging
 import math
+import threading
+import asyncio
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 
@@ -32,6 +34,8 @@ import requests
 from binance.client import Client
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update
 
 try:
     from dotenv import load_dotenv
@@ -85,6 +89,51 @@ def notify(msg: str, level: str = "info"):
             log.warning(f"No se pudo enviar notificacion a Telegram: {e}")
 
 # ============================================================
+# FORMATO DE MENSAJES (estilo visual, con separadores y PnL con/sin leverage)
+# ============================================================
+
+SEP = "─" * 28
+
+def fmt_open(direccion, entry_price, sl_price, sl_es_natural, capital, regimen_str):
+    env = "🧪 TESTNET" if USE_TESTNET else "💰 REAL"
+    dist_pct = abs(sl_price - entry_price) / entry_price * 100
+    tipo_sl = "natural" if sl_es_natural else "piso aplicado"
+    dir_str = "🟢 LONG" if direccion == "LONG" else "🔴 SHORT"
+    return (
+        f"{SEP}\n"
+        f"⚡ ENTRADA RATCHET {env}\n"
+        f"{SEP}\n"
+        f"Par:      {SYMBOL}\n"
+        f"Dir:      {dir_str}\n"
+        f"Entry:    {entry_price:,.2f}\n"
+        f"SL:       {sl_price:,.2f} (-{dist_pct:.2f}%, {tipo_sl})\n"
+        f"Régimen:  {regimen_str}\n"
+        f"Capital:  ${capital:,.2f} × {LEVERAGE}x\n"
+        f"{SEP}"
+    )
+
+def fmt_close(motivo, direccion, entry_price, exit_price, estado_extra=""):
+    """motivo: 'sl' | 'regimen' | 'manual'"""
+    pnl_pct = (exit_price - entry_price) * (1 if direccion == "LONG" else -1) / entry_price * 100
+    pnl_lev = pnl_pct * LEVERAGE
+    titulos = {"sl": "🛑 SL tocado", "regimen": "🔀 Cambio de régimen", "manual": "✋ Cierre manual"}
+    dir_str = "🟢 LONG" if direccion == "LONG" else "🔴 SHORT"
+    msg = (
+        f"{SEP}\n"
+        f"{titulos.get(motivo, '📤 Cierre')}\n"
+        f"{SEP}\n"
+        f"Dir:      {dir_str}\n"
+        f"Entry:    {entry_price:,.2f}\n"
+        f"Exit:     {exit_price:,.2f}\n"
+        f"PnL:      {pnl_pct:>+.3f}% (precio)\n"
+        f"PnL:      {pnl_lev:>+.3f}% ({LEVERAGE}x capital)\n"
+    )
+    if estado_extra:
+        msg += f"Estado:   {estado_extra}\n"
+    msg += SEP
+    return msg
+
+# ============================================================
 # CLIENTE BINANCE
 # ============================================================
 
@@ -111,6 +160,7 @@ def estado_default():
         "entry_price": None,
         "sl_order_id": None,
         "sl_price": None,
+        "sl_es_natural": True,      # True si el SL vigente es la formula pura, False si tiene piso/ratchet aplicado
         "current_period_open_time": None,   # timestamp (ms) del inicio del periodo de 4h actual
         "waiting_reentry": False,
         "reentry_order_id": None,
@@ -308,8 +358,7 @@ def abrir_posicion(symbol, direccion, precio_referencia):
     orden = client.futures_create_order(
         symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty
     )
-    emoji = "🟢" if direccion == "LONG" else "🔴"
-    notify(f"{emoji} {direccion} abierto\nPrecio: {precio_referencia:.2f}\nCantidad: {qty} {symbol}")
+    log.info(f"{direccion} abierto a mercado: {qty} {symbol} (precio ref {precio_referencia})")
     return orden
 
 class PosicionCerradaAMercado(Exception):
@@ -350,7 +399,7 @@ def colocar_sl(symbol, direccion, sl_price, qty):
             algoType="CONDITIONAL", symbol=symbol, side=side, type="STOP_MARKET",
             triggerPrice=sl_price, closePosition="true",
         )
-        notify(f"🛡️ SL colocado ({direccion})\nNivel: {sl_price:.2f}")
+        log.info(f"SL colocado ({direccion}) a {sl_price} [algoId={orden.get('algoId')}]")
         return orden
     except BinanceAPIException as e:
         if e.code == -2021:
@@ -505,6 +554,7 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
                                 no_reintentar=(PosicionCerradaAMercado,))
         estado["sl_order_id"] = orden["algoId"]
         estado["sl_price"] = sl_price_calc
+        estado["sl_es_natural"] = (sl_price_calc == sl_price_original)
         estado["current_period_open_time"] = periodo_ms
         guardar_estado(estado)
         return True
@@ -555,13 +605,15 @@ def ciclo():
 
         # chequear si el SL se ejecuto (via el tamaño real de la posicion, no el status de la orden)
         if sl_fue_tocado(SYMBOL, estado["position"]):
-            dirn_num = 1 if estado["position"] == "LONG" else -1
-            pct = ((estado["sl_price"]/estado["entry_price"]) - 1) * 100 * dirn_num if estado["entry_price"] else None
-            pct_str = f"{pct:+.2f}%" if pct is not None else "N/D"
-            notify(f"🔴 SL tocado - posicion cerrada\n{estado['position']} cerrado en {estado['sl_price']:.2f}\nResultado: {pct_str}\nEsperando reentrada...")
+            direccion_cerrada = estado["position"]
+            entry_previo = estado["entry_price"]
+            sl_previo = estado["sl_price"]
+            nivel_reentrada = sl_price_calc  # nivel NATURAL (sin piso/ratchet) -- validado que da mejor resultado que reentrar en el nivel real donde cerro
+            notify(fmt_close("sl", direccion_cerrada, entry_previo, sl_previo,
+                              estado_extra=f"⏳ Esperando reentrada en {nivel_reentrada:.2f}"))
             estado["waiting_reentry"] = True
-            estado["reentry_dirn"] = estado["position"]
-            estado["reentry_price"] = sl_price_calc  # nivel NATURAL (sin piso/ratchet) -- validado que da mejor resultado que reentrar en el nivel real donde cerro
+            estado["reentry_dirn"] = direccion_cerrada
+            estado["reentry_price"] = nivel_reentrada
             estado["position"] = None
             estado["entry_price"] = None
             estado["sl_order_id"] = None
@@ -629,8 +681,7 @@ def ciclo():
             return
 
         if reentrada_fue_tocada(SYMBOL, estado["reentry_dirn"]):
-            emoji = "🟢" if estado["reentry_dirn"] == "LONG" else "🔴"
-            notify(f"{emoji} Reentrada ejecutada\n{estado['reentry_dirn']} @ {estado['reentry_price']:.2f}")
+            log.info(f"Reentrada ejecutada {estado['reentry_dirn']} @ {estado['reentry_price']:.2f}")
             estado["position"] = estado["reentry_dirn"]
             estado["entry_price"] = estado["reentry_price"]
             estado["waiting_reentry"] = False
@@ -641,7 +692,14 @@ def ciclo():
             # colocar el SL del periodo actual
             if sl_price_calc is not None:
                 try:
-                    colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms)
+                    if colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms):
+                        try:
+                            capital = obtener_capital_disponible()
+                        except Exception:
+                            capital = 0
+                        regimen_str = f"{estado['position']} (EMA{EMA_SPAN})"
+                        notify(fmt_open(estado["position"], estado["entry_price"], estado["sl_price"],
+                                         estado["sl_es_natural"], capital, regimen_str))
                 except Exception as e:
                     notify(f"⚠️ ALERTA: reentrada ejecutada pero el SL fallo: {e}. Se reintentara el proximo ciclo.", level="error")
             return
@@ -667,11 +725,18 @@ def ciclo():
         estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
         estado["current_period_open_time"] = periodo_ms
         guardar_estado(estado)
-        notify(f"💾 Posicion abierta, guardando estado antes de intentar el SL...")
+        log.info(f"Posicion abierta, guardando estado antes de intentar el SL...")
 
         if sl_price_calc is not None:
             try:
-                colocar_sl_o_pasar_a_espera(direccion_regimen, sl_price_calc, periodo_ms)
+                if colocar_sl_o_pasar_a_espera(direccion_regimen, sl_price_calc, periodo_ms):
+                    try:
+                        capital = obtener_capital_disponible()
+                    except Exception:
+                        capital = 0
+                    regimen_str = f"{direccion_regimen} (EMA{EMA_SPAN})"
+                    notify(fmt_open(direccion_regimen, estado["entry_price"], estado["sl_price"],
+                                     estado["sl_es_natural"], capital, regimen_str))
             except Exception as e:
                 notify(f"⚠️ ALERTA: posicion abierta pero el SL fallo tras varios reintentos: {e}. Se reintentara en el proximo ciclo.", level="error")
                 # no re-lanzamos: el proximo ciclo va a entrar por el chequeo de "sl_order_id is None" de arriba
@@ -729,14 +794,133 @@ def reconciliar_estado_inicial():
                 pass
             guardar_estado(estado)
 
+# ============================================================
+# COMANDOS INTERACTIVOS DE TELEGRAM
+# ============================================================
+
+estado_lock = threading.Lock()  # protege 'estado' entre el loop principal y los comandos de Telegram
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    env = "🧪 TESTNET" if USE_TESTNET else "💰 REAL"
+    await update.message.reply_text(
+        f"🤖 Ratchet Bot EMA{EMA_SPAN} (4h) {env}\n\n"
+        f"Par: {SYMBOL} · Lev: {LEVERAGE}x · SL={int(SL_FRACTION*100)}% del rango previo · Piso={SL_MIN_PCT}%\n\n"
+        f"/status /close /balance /help"
+    )
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "/start   — info del bot\n"
+        "/status  — posición o espera activa\n"
+        "/close   — cerrar posición manualmente\n"
+        "/balance — balance USDT\n"
+        "/help    — esta ayuda"
+    )
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    with estado_lock:
+        snap = dict(estado)
+    try:
+        velas = obtener_klines_4h(SYMBOL, limit=300)
+        regimen, sl_price_calc, _, _ = calcular_regimen_y_sl(velas)
+        regimen_str = "LONG" if regimen == 1 else ("SHORT" if regimen == -1 else "sin definir")
+    except Exception:
+        regimen_str = "no disponible"
+
+    if snap["position"] is None and not snap["waiting_reentry"]:
+        await update.message.reply_text(f"📭 Sin posición activa\nRégimen actual: {regimen_str} (EMA{EMA_SPAN})")
+        return
+
+    if snap["waiting_reentry"]:
+        await update.message.reply_text(
+            f"⏳ Esperando reentrada\n"
+            f"Dirección: {snap['reentry_dirn']}\n"
+            f"Nivel: {snap['reentry_price']:.2f}\n"
+            f"Régimen actual: {regimen_str} (EMA{EMA_SPAN})"
+        )
+        return
+
+    try:
+        mark = obtener_precio_actual(SYMBOL)
+        dirn_num = 1 if snap["position"] == "LONG" else -1
+        pnl = (mark - snap["entry_price"]) * dirn_num / snap["entry_price"] * 100
+    except Exception:
+        mark = pnl = 0
+    dist_sl = abs(snap["sl_price"] - snap["entry_price"]) / snap["entry_price"] * 100 if snap["sl_price"] else 0
+    coincide = "✅ coincide" if snap["position"] == regimen_str else "⚠️ no coincide"
+    await update.message.reply_text(
+        f"📊 Posición activa\n"
+        f"Dir:    {'🟢' if snap['position']=='LONG' else '🔴'} {snap['position']}\n"
+        f"Entry:  {snap['entry_price']:,.2f}\n"
+        f"Mark:   {mark:,.2f}\n"
+        f"PnL:    {pnl:+.2f}%\n"
+        f"SL:     {snap['sl_price']:,.2f} (-{dist_sl:.2f}%)\n"
+        f"Régimen: {regimen_str} (EMA{EMA_SPAN}) {coincide}"
+    )
+
+async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global estado
+    with estado_lock:
+        if estado["position"] is None:
+            await update.message.reply_text("📭 Sin posición activa.")
+            return
+        direccion = estado["position"]
+        entry_price = estado["entry_price"]
+        sl_order_id = estado["sl_order_id"]
+        try:
+            cancelar_orden(SYMBOL, sl_order_id)
+            side = SIDE_SELL if direccion == "LONG" else SIDE_BUY
+            qty = abs(posicion_abierta(SYMBOL))
+            if DRY_RUN:
+                exit_price = obtener_precio_actual(SYMBOL)
+            else:
+                orden = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=qty)
+                exit_price = float(orden.get("avgPrice") or 0) or obtener_precio_actual(SYMBOL)
+            estado = estado_default()
+            guardar_estado(estado)
+            await update.message.reply_text(fmt_close("manual", direccion, entry_price, exit_price))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error cerrando posición: {e}")
+
+async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        bal = obtener_capital_disponible()
+        await update.message.reply_text(f"💰 Balance: ${bal:,.2f} USDT")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error consultando balance: {e}")
+
+def iniciar_telegram_listener():
+    """Corre el listener de comandos de Telegram en su propio hilo y su propio event
+    loop, en paralelo al loop de trading principal (que sigue siendo sincronico)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("Telegram no configurado -- comandos interactivos deshabilitados.")
+        return
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CommandHandler("status", cmd_status))
+        app.add_handler(CommandHandler("close", cmd_close))
+        app.add_handler(CommandHandler("balance", cmd_balance))
+        log.info("Listener de comandos de Telegram iniciado.")
+        app.run_polling(drop_pending_updates=True, close_loop=False, stop_signals=None)
+
+    hilo = threading.Thread(target=_run, daemon=True)
+    hilo.start()
+
 def main():
     modo = "🧪 DRY RUN (simulacion)" if DRY_RUN else "💰 CUENTA REAL"
     notify(f"🤖 Bot iniciado\nSymbol: {SYMBOL} | Leverage: {LEVERAGE}x\nModo: {modo}")
     con_reintentos(configurar_leverage, None, 5, SYMBOL, LEVERAGE)
     con_reintentos(reconciliar_estado_inicial, None, 5)
+    iniciar_telegram_listener()
     while True:
         try:
-            ciclo()
+            with estado_lock:
+                ciclo()
         except Exception as e:
             log.exception(f"Error en el ciclo principal: {e}")
             notify(f"🚨 ERROR en el bot: {e}", level="error")

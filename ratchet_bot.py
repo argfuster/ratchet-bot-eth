@@ -472,6 +472,17 @@ def posicion_abierta(symbol):
             return float(p["positionAmt"])
     return 0.0
 
+def entry_price_real(symbol):
+    """Devuelve el precio de entrada REAL (promedio) de la posicion segun el exchange
+    -- Binance lo expone directamente en el mismo endpoint de posicion (entryPrice),
+    no hace falta aproximarlo con el precio de mercado actual."""
+    posiciones = client.futures_position_information(symbol=symbol)
+    for p in posiciones:
+        if p["symbol"] == symbol:
+            ep = float(p.get("entryPrice", 0))
+            return ep if ep > 0 else None
+    return None
+
 def sl_fue_tocado(symbol, direccion_esperada):
     """Chequeo robusto: en vez de parsear el status de la algo order (cuyo string
     exacto de 'disparada' no esta 100% documentado), consultamos directamente si la
@@ -756,8 +767,8 @@ def reconciliar_estado_inicial():
         notify(f"🔍 Posicion {direccion} existente detectada en el exchange ({qty_exchange})\nEl estado local no la conocia -- adoptando.", level="warning")
         estado["position"] = direccion
         try:
-            precio_actual = obtener_precio_actual(SYMBOL)
-            estado["entry_price"] = precio_actual  # aproximado; no tenemos el entry real si no lo guardamos antes
+            entry_real = entry_price_real(SYMBOL)
+            estado["entry_price"] = entry_real if entry_real is not None else obtener_precio_actual(SYMBOL)
         except Exception:
             pass
         existente = buscar_stop_existente(SYMBOL)

@@ -166,6 +166,7 @@ def estado_default():
         "reentry_order_id": None,
         "reentry_price": None,
         "reentry_dirn": None,       # "LONG" | "SHORT"
+        "paused": False,            # si True, el bot no abre posiciones nuevas ni reentra (pero sigue protegiendo una posicion ya abierta si la hubiera)
     }
 
 def cargar_estado():
@@ -667,7 +668,7 @@ def ciclo():
         # guardar el order_id -- visto en vivo el 22-ago-2026), reintentar colocarla
         # antes de cualquier otra cosa. Sin esto, el bot queda esperando en silencio
         # para siempre, sin ninguna orden que pueda dispararse.
-        if estado["reentry_order_id"] is None and direccion_regimen == estado["reentry_dirn"]:
+        if estado["reentry_order_id"] is None and direccion_regimen == estado["reentry_dirn"] and not estado.get("paused", False):
             try:
                 orden = con_reintentos(colocar_orden_reentrada, 6, 3, SYMBOL, estado["reentry_dirn"], estado["reentry_price"],
                                         no_reintentar=(ReentradaYaDisparada,))
@@ -727,7 +728,7 @@ def ciclo():
         return
 
     # --- Caso 3: plano, sin espera activa -> evaluar entrada nueva ---
-    if direccion_regimen is not None:
+    if direccion_regimen is not None and not estado.get("paused", False):
         precio_actual = obtener_precio_actual(SYMBOL)
         orden_entrada = con_reintentos(abrir_posicion, 4, 3, SYMBOL, direccion_regimen, precio_actual)
         estado["position"] = direccion_regimen
@@ -816,7 +817,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🤖 Ratchet Bot EMA{EMA_SPAN} (4h) {env}\n\n"
         f"Par: {SYMBOL} · Lev: {LEVERAGE}x · SL={int(SL_FRACTION*100)}% del rango previo · Piso={SL_MIN_PCT}%\n\n"
-        f"/status /close /reset /balance /help"
+        f"/status /close /reset /pause /resume /balance /help"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -825,6 +826,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/status  — posición o espera activa\n"
         "/close   — cerrar posición manualmente\n"
         "/reset   — resetear estado (tras un cierre manual, evita reentradas fantasma)\n"
+        "/pause   — pausar (no abre nuevas posiciones ni reentra)\n"
+        "/resume  — reanudar tras /pause\n"
         "/balance — balance USDT\n"
         "/help    — esta ayuda"
     )
@@ -840,7 +843,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         regimen_str = "no disponible"
 
     if snap["position"] is None and not snap["waiting_reentry"]:
-        await update.message.reply_text(f"📭 Sin posición activa\nRégimen actual: {regimen_str} (EMA{EMA_SPAN})")
+        pausa_str = "\n⏸️ PAUSADO" if snap.get("paused") else ""
+        await update.message.reply_text(f"📭 Sin posición activa\nRégimen actual: {regimen_str} (EMA{EMA_SPAN}){pausa_str}")
         return
 
     if snap["waiting_reentry"]:
@@ -945,6 +949,47 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"🔄 Estado reseteado -- el bot vuelve a evaluar el régimen desde cero en el próximo ciclo.{detalle}"
         )
 
+async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pausa el bot: no va a abrir posiciones nuevas ni reentrar mientras este pausado.
+    Si habia una orden de reentrada pendiente esperando, la cancela (si no, quedaria
+    viva en el exchange y podria ejecutarse igual, sin que el bot lo gestione). Si hay
+    una posicion REAL abierta, la deja intacta y sigue protegiendola con su SL normal
+    -- pausar no la cierra, solo evita que se abra una posicion NUEVA despues."""
+    global estado
+    with estado_lock:
+        if estado.get("paused"):
+            await update.message.reply_text("⏸️ Ya estaba pausado.")
+            return
+        estado["paused"] = True
+        aviso_extra = ""
+        if estado["waiting_reentry"]:
+            oid = estado.get("reentry_order_id")
+            if oid:
+                try:
+                    con_reintentos(cancelar_orden, 3, 2, SYMBOL, oid)
+                    aviso_extra = " (orden de reentrada pendiente cancelada)"
+                except Exception as e:
+                    log.warning(f"No se pudo cancelar orden de reentrada al pausar: {e}")
+            estado["waiting_reentry"] = False
+            estado["reentry_order_id"] = None
+            estado["reentry_price"] = None
+            estado["reentry_dirn"] = None
+        guardar_estado(estado)
+        nota_posicion = ""
+        if estado["position"] is not None:
+            nota_posicion = f"\n⚠️ Sigue habiendo una posición {estado['position']} abierta -- el bot la va a seguir protegiendo con su SL normal, pausar solo evita abrir una posición NUEVA después."
+        await update.message.reply_text(f"⏸️ Bot pausado{aviso_extra} -- no va a abrir ni reentrar hasta /resume.{nota_posicion}")
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global estado
+    with estado_lock:
+        if not estado.get("paused"):
+            await update.message.reply_text("▶️ No estaba pausado.")
+            return
+        estado["paused"] = False
+        guardar_estado(estado)
+        await update.message.reply_text("▶️ Bot reanudado -- vuelve a evaluar entradas en el próximo ciclo.")
+
 def iniciar_telegram_listener():
     """Corre el listener de comandos de Telegram en su propio hilo y su propio event
     loop, en paralelo al loop de trading principal (que sigue siendo sincronico)."""
@@ -961,6 +1006,8 @@ def iniciar_telegram_listener():
         app.add_handler(CommandHandler("status", cmd_status))
         app.add_handler(CommandHandler("close", cmd_close))
         app.add_handler(CommandHandler("reset", cmd_reset))
+        app.add_handler(CommandHandler("pause", cmd_pause))
+        app.add_handler(CommandHandler("resume", cmd_resume))
         app.add_handler(CommandHandler("balance", cmd_balance))
         log.info("Listener de comandos de Telegram iniciado.")
         app.run_polling(drop_pending_updates=True, close_loop=False, stop_signals=None)

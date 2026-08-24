@@ -248,11 +248,21 @@ def aplicar_piso_sl(sl_price, entry_price, direccion):
     piso minimo (SL_MIN_PCT), la reemplaza por esa distancia minima. Protege contra
     el caso donde una reentrada ocurre muy cerca del cierre de un periodo de 4h,
     dejando el SL natural practicamente pegado al precio de entrada (visto en vivo
-    el 22-ago-2026: genero una cascada de ~22 aperturas/cierres en 3 horas)."""
+    el 22-ago-2026: genero una cascada de ~22 aperturas/cierres en 3 horas).
+
+    Tambien cubre el caso mas degenerado: si el precio se movio bastante DENTRO del
+    mismo periodo de 4h desde que se fijo el open de referencia, el SL 'natural'
+    (siempre anclado a ese open fijo, sin importar donde este el precio ahora) puede
+    terminar directamente del LADO INCORRECTO del precio de entrada -- arriba en un
+    largo, abajo en un corto -- incluso con una distancia nominal mayor al piso (visto
+    en vivo el 24-ago-2026: SL de 2437.87 con entrada en 2431.77, del lado equivocado,
+    con 0.2508% de distancia -- paso el chequeo original por muy poco)."""
     if entry_price is None or entry_price == 0:
         return sl_price
+    del_lado_incorrecto = (direccion == "LONG" and sl_price >= entry_price) or \
+                           (direccion == "SHORT" and sl_price <= entry_price)
     dist_pct = abs(sl_price - entry_price) / entry_price * 100
-    if dist_pct < SL_MIN_PCT:
+    if del_lado_incorrecto or dist_pct < SL_MIN_PCT:
         if direccion == "LONG":
             return entry_price * (1 - SL_MIN_PCT/100)
         else:
@@ -499,10 +509,10 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
         guardar_estado(estado)
         return True
     except PosicionCerradaAMercado:
-        notify(f"🔴 Posicion cerrada de emergencia (SL calculado invalido para este punto del periodo)\nPasando a espera de reentrada en {sl_price_calc:.2f}", level="warning")
+        notify(f"🔴 Posicion cerrada de emergencia (SL calculado invalido para este punto del periodo)\nPasando a espera de reentrada en {sl_price_original:.2f}", level="warning")
         estado["waiting_reentry"] = True
         estado["reentry_dirn"] = direccion
-        estado["reentry_price"] = sl_price_calc
+        estado["reentry_price"] = sl_price_original  # nivel NATURAL, no el ajustado por piso/ratchet
         estado["position"] = None
         estado["entry_price"] = None
         estado["sl_order_id"] = None
@@ -551,7 +561,7 @@ def ciclo():
             notify(f"🔴 SL tocado - posicion cerrada\n{estado['position']} cerrado en {estado['sl_price']:.2f}\nResultado: {pct_str}\nEsperando reentrada...")
             estado["waiting_reentry"] = True
             estado["reentry_dirn"] = estado["position"]
-            estado["reentry_price"] = estado["sl_price"]
+            estado["reentry_price"] = sl_price_calc  # nivel NATURAL (sin piso/ratchet) -- validado que da mejor resultado que reentrar en el nivel real donde cerro
             estado["position"] = None
             estado["entry_price"] = None
             estado["sl_order_id"] = None

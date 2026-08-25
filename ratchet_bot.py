@@ -553,21 +553,20 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
         guardar_estado(estado)
         return False
 
-    sl_price_original = sl_price_calc
-    precio_actual = obtener_precio_actual(SYMBOL)
-    sl_price_calc = aplicar_piso_sl(sl_price_calc, precio_actual, direccion)
-    if sl_price_calc != sl_price_original:
-        log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}% respecto al precio actual)")
-
-    # Ratchet estricto: el SL nunca retrocede respecto al nivel ya vigente -- solo puede
-    # mejorar (subir en largo, bajar en corto). Validado contra 2024+/2025/2026: mejora
-    # z-score y acumulado en la muestra grande, neutro en la mas chica, nunca empeora.
+    # Verificar el SL previo REAL (exchange, no solo memoria del bot) ANTES de decidir
+    # si corresponde aplicar el piso -- el orden importa: el backtest validado solo
+    # aplica el piso la PRIMERA vez que se coloca el SL de una posicion (equivalente a
+    # sl_actual=None), nunca en las actualizaciones posteriores vela a vela. Aplicarlo
+    # tambien ahi (como hacia el bot antes de este fix) es una desviacion real de lo
+    # validado, y fue la causa de fondo del bug del 25-ago-2026 (revirtio un avance
+    # legitimo del ratchet).
     #
     # El "nivel ya vigente" se verifica contra el exchange, no solo contra la memoria
     # del bot -- si alguien cambio el SL manualmente en Binance (visto en vivo el
     # 25-ago-2026), estado["sl_price"] queda desincronizado de la realidad, y confiar
     # ciegamente en el podria dejar que el ratchet "mejore" hacia un nivel que en
     # realidad es un retroceso respecto al SL real ya colocado.
+    sl_price_original = sl_price_calc
     sl_previo_estado = estado.get("sl_price")
     sl_previo_real = None
     existente = buscar_stop_existente(SYMBOL)
@@ -580,6 +579,14 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
         sl_previo = max(sl_previo_estado, sl_previo_real) if direccion == "LONG" else min(sl_previo_estado, sl_previo_real)
     else:
         sl_previo = sl_previo_real if sl_previo_real is not None else sl_previo_estado
+
+    if sl_previo is None:
+        # primera vez que se coloca el SL de esta posicion (equivalente a sl_actual=None
+        # en el backtest) -- aca si corresponde el piso, igual que en la reentrada validada
+        precio_actual = obtener_precio_actual(SYMBOL)
+        sl_price_calc = aplicar_piso_sl(sl_price_calc, precio_actual, direccion)
+        if sl_price_calc != sl_price_original:
+            log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}% respecto al precio actual)")
 
     if sl_previo is not None:
         if direccion == "LONG" and sl_previo > sl_price_calc:

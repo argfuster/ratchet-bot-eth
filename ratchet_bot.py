@@ -904,7 +904,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pnl = (mark - snap["entry_price"]) * dirn_num / snap["entry_price"] * 100
     except Exception:
         mark = pnl = 0
-    dist_sl = abs(snap["sl_price"] - snap["entry_price"]) / snap["entry_price"] * 100 if snap["sl_price"] else 0
+
+    # verificar el SL REAL contra el exchange, no solo confiar en la memoria del bot --
+    # si alguien cambio el SL manualmente en Binance, snap["sl_price"] queda desincronizado
+    sl_mostrado = snap["sl_price"]
+    aviso_desync = ""
+    try:
+        existente = buscar_stop_existente(SYMBOL)
+        if existente is not None:
+            sl_real = existente["triggerPrice"]
+            if snap["sl_price"] is None or abs(sl_real - snap["sl_price"]) > 0.01:
+                aviso_desync = f"\n⚠️ El bot creía SL={snap['sl_price']:.2f} pero el exchange tiene {sl_real:.2f} -- mostrando el real."
+                sl_mostrado = sl_real
+        elif snap["sl_price"] is not None:
+            aviso_desync = f"\n🚨 El bot cree que hay un SL en {snap['sl_price']:.2f} pero NO se encontró ninguna orden activa en el exchange."
+    except Exception as e:
+        aviso_desync = f"\n⚠️ No se pudo verificar el SL contra el exchange: {e}"
+
+    dist_sl = abs(sl_mostrado - snap["entry_price"]) / snap["entry_price"] * 100 if sl_mostrado else 0
     coincide = "✅ coincide" if snap["position"] == regimen_str else "⚠️ no coincide"
     await update.message.reply_text(
         f"📊 Posición activa\n"
@@ -912,8 +929,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Entry:  {snap['entry_price']:,.2f}\n"
         f"Mark:   {mark:,.2f}\n"
         f"PnL:    {pnl:+.2f}%\n"
-        f"SL:     {snap['sl_price']:,.2f} (-{dist_sl:.2f}%)\n"
+        f"SL:     {sl_mostrado:,.2f} (-{dist_sl:.2f}%)\n"
         f"Régimen: {regimen_str} (EMA{EMA_SPAN}) {coincide}"
+        f"{aviso_desync}"
     )
 
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

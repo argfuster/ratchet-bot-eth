@@ -582,11 +582,18 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
 
     if sl_previo is None:
         # primera vez que se coloca el SL de esta posicion (equivalente a sl_actual=None
-        # en el backtest) -- aca si corresponde el piso, igual que en la reentrada validada
-        precio_actual = obtener_precio_actual(SYMBOL)
-        sl_price_calc = aplicar_piso_sl(sl_price_calc, precio_actual, direccion)
+        # en el backtest) -- aca si corresponde el piso, igual que en la reentrada validada.
+        # Usa entry_price (no precio de mercado) para el calculo del piso: como esta
+        # funcion ahora SOLO corre en la primera colocacion (nunca en actualizaciones
+        # sobre una posicion ya ratcheteada), entry_price ya no puede estar "viejo" como
+        # pasaba en el bug del 25-ago -- y usarlo da una distancia de piso EXACTA de
+        # SL_MIN_PCT%, sin el ruido de los segundos que pasan entre que se ejecuta la
+        # reentrada y se coloca el SL (con precio de mercado, ese pequeño desfasaje hacia
+        # que el piso real terminara dando 0.13%-0.25% en vez de 0.25% fijo).
+        entry_ref = estado.get("entry_price")
+        sl_price_calc = aplicar_piso_sl(sl_price_calc, entry_ref, direccion)
         if sl_price_calc != sl_price_original:
-            log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}% respecto al precio actual)")
+            log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}% respecto al precio de entrada)")
 
     if sl_previo is not None:
         if direccion == "LONG" and sl_previo > sl_price_calc:

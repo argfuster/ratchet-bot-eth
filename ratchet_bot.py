@@ -294,8 +294,8 @@ def calcular_regimen_y_sl(velas):
 
     return regimen, sl_price, vela_actual, vela_anterior
 
-def aplicar_piso_sl(sl_price, entry_price, direccion):
-    """Si la distancia entre el SL natural y el precio de entrada real es menor al
+def aplicar_piso_sl(sl_price, precio_referencia, direccion):
+    """Si la distancia entre el SL natural y el precio de referencia es menor al
     piso minimo (SL_MIN_PCT), la reemplaza por esa distancia minima. Protege contra
     el caso donde una reentrada ocurre muy cerca del cierre de un periodo de 4h,
     dejando el SL natural practicamente pegado al precio de entrada (visto en vivo
@@ -304,20 +304,29 @@ def aplicar_piso_sl(sl_price, entry_price, direccion):
     Tambien cubre el caso mas degenerado: si el precio se movio bastante DENTRO del
     mismo periodo de 4h desde que se fijo el open de referencia, el SL 'natural'
     (siempre anclado a ese open fijo, sin importar donde este el precio ahora) puede
-    terminar directamente del LADO INCORRECTO del precio de entrada -- arriba en un
-    largo, abajo en un corto -- incluso con una distancia nominal mayor al piso (visto
-    en vivo el 24-ago-2026: SL de 2437.87 con entrada en 2431.77, del lado equivocado,
-    con 0.2508% de distancia -- paso el chequeo original por muy poco)."""
-    if entry_price is None or entry_price == 0:
+    terminar directamente del LADO INCORRECTO del precio -- arriba en un largo, abajo
+    en un corto (visto en vivo el 24-ago-2026).
+
+    IMPORTANTE: precio_referencia debe ser el precio ACTUAL de mercado, NO el precio
+    de entrada original de la posicion. Usar el entry_price original rompe el ratchet
+    en posiciones que vienen ganando hace varios periodos: una vez que el SL legitimo
+    supera la entrada original (exactamente el objetivo de un trailing stop que
+    protege ganancias), comparar contra esa entrada vieja marca el avance real como
+    'del lado incorrecto' y lo fuerza hacia abajo, deshaciendo ganancias ya aseguradas
+    (bug real visto en vivo el 25-ago-2026: dos actualizaciones seguidas revirtieron
+    un SL que habia subido a 2466.73 de vuelta a 2450.79, perdiendo ~16 puntos de
+    proteccion ya ganada, porque 2466.73 superaba la entrada original aunque seguia
+    perfectamente por debajo del precio de mercado vigente)."""
+    if precio_referencia is None or precio_referencia == 0:
         return sl_price
-    del_lado_incorrecto = (direccion == "LONG" and sl_price >= entry_price) or \
-                           (direccion == "SHORT" and sl_price <= entry_price)
-    dist_pct = abs(sl_price - entry_price) / entry_price * 100
+    del_lado_incorrecto = (direccion == "LONG" and sl_price >= precio_referencia) or \
+                           (direccion == "SHORT" and sl_price <= precio_referencia)
+    dist_pct = abs(sl_price - precio_referencia) / precio_referencia * 100
     if del_lado_incorrecto or dist_pct < SL_MIN_PCT:
         if direccion == "LONG":
-            return entry_price * (1 - SL_MIN_PCT/100)
+            return precio_referencia * (1 - SL_MIN_PCT/100)
         else:
-            return entry_price * (1 + SL_MIN_PCT/100)
+            return precio_referencia * (1 + SL_MIN_PCT/100)
     return sl_price
 
 # ============================================================
@@ -545,14 +554,33 @@ def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
         return False
 
     sl_price_original = sl_price_calc
-    sl_price_calc = aplicar_piso_sl(sl_price_calc, estado.get("entry_price"), direccion)
+    precio_actual = obtener_precio_actual(SYMBOL)
+    sl_price_calc = aplicar_piso_sl(sl_price_calc, precio_actual, direccion)
     if sl_price_calc != sl_price_original:
-        log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}%)")
+        log.info(f"Piso de SL aplicado: {sl_price_original:.2f} -> {sl_price_calc:.2f} (distancia natural menor a {SL_MIN_PCT}% respecto al precio actual)")
 
     # Ratchet estricto: el SL nunca retrocede respecto al nivel ya vigente -- solo puede
     # mejorar (subir en largo, bajar en corto). Validado contra 2024+/2025/2026: mejora
     # z-score y acumulado en la muestra grande, neutro en la mas chica, nunca empeora.
-    sl_previo = estado.get("sl_price")
+    #
+    # El "nivel ya vigente" se verifica contra el exchange, no solo contra la memoria
+    # del bot -- si alguien cambio el SL manualmente en Binance (visto en vivo el
+    # 25-ago-2026), estado["sl_price"] queda desincronizado de la realidad, y confiar
+    # ciegamente en el podria dejar que el ratchet "mejore" hacia un nivel que en
+    # realidad es un retroceso respecto al SL real ya colocado.
+    sl_previo_estado = estado.get("sl_price")
+    sl_previo_real = None
+    existente = buscar_stop_existente(SYMBOL)
+    if existente is not None:
+        sl_previo_real = existente["triggerPrice"]
+        if sl_previo_estado is not None and abs(sl_previo_real - sl_previo_estado) > 0.01:
+            log.warning(f"Desincronizacion detectada: el bot creia SL={sl_previo_estado:.2f} pero el exchange tiene {sl_previo_real:.2f} (posible cambio manual). Usando el valor real del exchange.")
+    # usar el mas protector entre lo que el bot cree y lo que el exchange realmente tiene
+    if sl_previo_estado is not None and sl_previo_real is not None:
+        sl_previo = max(sl_previo_estado, sl_previo_real) if direccion == "LONG" else min(sl_previo_estado, sl_previo_real)
+    else:
+        sl_previo = sl_previo_real if sl_previo_real is not None else sl_previo_estado
+
     if sl_previo is not None:
         if direccion == "LONG" and sl_previo > sl_price_calc:
             log.info(f"Ratchet: manteniendo SL previo ({sl_previo:.2f}) en vez de retroceder a {sl_price_calc:.2f}")
@@ -610,7 +638,7 @@ def ciclo():
             notify(f"⚠️ ALERTA: posicion {estado['position']} sin SL colocado. Reintentando colocar SL de emergencia...", level="warning")
             try:
                 if colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms):
-                    notify(f"✅ SL de emergencia colocado correctamente\nNivel: {sl_price_calc:.2f}")
+                    notify(f"✅ SL de emergencia colocado correctamente\nNivel: {estado['sl_price']:.2f}")
             except Exception as e:
                 notify(f"🚨 CRITICO: no se pudo colocar el SL de emergencia tras varios reintentos: {e}. Requiere intervencion manual inmediata.", level="error")
             return
@@ -658,7 +686,7 @@ def ciclo():
         if nuevo_periodo and sl_price_calc is not None and direccion_regimen == estado["position"]:
             sl_anterior = estado["sl_price"]
             if colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms):
-                notify(f"🔄 SL actualizado (nuevo periodo 4h)\n{sl_anterior:.2f} → {sl_price_calc:.2f}")
+                notify(f"🔄 SL actualizado (nuevo periodo 4h)\n{sl_anterior:.2f} → {estado['sl_price']:.2f}")
         return
 
     # --- Caso 2: esperando reentrada ---

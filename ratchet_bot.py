@@ -167,6 +167,8 @@ def estado_default():
         "reentry_price": None,
         "reentry_dirn": None,       # "LONG" | "SHORT"
         "paused": False,            # si True, el bot no abre posiciones nuevas ni reentra (pero sigue protegiendo una posicion ya abierta si la hubiera)
+        "extremo": None,            # maximo (LONG) o minimo (SHORT) alcanzado desde que se abrio la posicion -- para el trailing intra-vela cada 5m
+        "ultimo_cierre_5m_ts": None,  # timestamp (ms) del ultimo cierre de 5m ya incorporado al extremo, para no reprocesar la misma vela
     }
 
 def cargar_estado():
@@ -257,6 +259,17 @@ def obtener_klines_4h(symbol, limit=300):
             "low": float(k[3]), "close": float(k[4]), "close_time": k[6],
         })
     return velas
+
+def obtener_ultimo_cierre_5m(symbol):
+    """Trae la ultima vela de 5m ya CERRADA (no la que esta en curso) -- se usa para
+    el trailing intra-vela del SL, validado contra 2024/2025/2026: actualizar el
+    'extremo' de referencia cada 5min (en vez de una vez por vela de 4h) mejora el
+    resultado en los seis cortes, capturando ganancias intermedias que el diseño
+    anterior dejaba pasar. Devuelve (close_time_ms, close_price)."""
+    raw = client.futures_klines(symbol=symbol, interval="5m", limit=2)
+    # la ultima puede seguir en curso -- tomamos la anteultima, que ya cerro seguro
+    vela_cerrada = raw[-2] if len(raw) >= 2 else raw[-1]
+    return int(vela_cerrada[6]), float(vela_cerrada[4])  # close_time, close
 
 def calcular_ema(closes, span):
     alpha = 2 / (span + 1)
@@ -536,6 +549,43 @@ def colocar_sl_seguro(symbol, direccion, sl_price, qty):
         time.sleep(1)  # pequeño margen para que el exchange propague la cancelacion
     return colocar_sl(symbol, direccion, sl_price, qty)
 
+def actualizar_trailing_5m(direccion, rango_anterior, periodo_ms):
+    """Actualiza el 'extremo' de referencia (maximo alcanzado en largo, minimo en corto)
+    usando el ultimo cierre de 5m YA CERRADO, y si corresponde, mejora el SL en base a
+    ese extremo -- validado contra 2024/2025/2026: mejora WR, ratio ganancia/perdida,
+    MaxDD y resultado neto en los seis cortes, en los dos activos, frente a actualizar
+    el SL solo una vez por vela de 4h.
+
+    Se llama en CADA ciclo (cada 30s), pero solo actualiza de verdad cuando detecta un
+    cierre de 5m nuevo que todavia no proceso -- evita llamados innecesarios al exchange.
+
+    A diferencia de un cambio de periodo de 4h, esto NO manda notificacion a Telegram
+    (seria decenas de mensajes por dia) -- solo queda en el log. Los eventos que si
+    importan (apertura, cierre por SL, reentrada) siguen notificando como siempre."""
+    global estado
+    try:
+        cierre_ts, cierre_precio = obtener_ultimo_cierre_5m(SYMBOL)
+    except Exception as e:
+        log.warning(f"No se pudo obtener el ultimo cierre de 5m para el trailing: {e}")
+        return
+
+    if estado.get("ultimo_cierre_5m_ts") == cierre_ts:
+        return  # ya procesado, nada nuevo que hacer
+
+    estado["ultimo_cierre_5m_ts"] = cierre_ts
+    extremo_anterior = estado.get("extremo")
+    if extremo_anterior is None:
+        extremo_anterior = estado.get("entry_price")
+    nuevo_extremo = max(extremo_anterior, cierre_precio) if direccion == "LONG" else min(extremo_anterior, cierre_precio)
+    estado["extremo"] = nuevo_extremo
+
+    sl_candidato = nuevo_extremo - SL_FRACTION * rango_anterior if direccion == "LONG" else nuevo_extremo + SL_FRACTION * rango_anterior
+    try:
+        colocar_sl_o_pasar_a_espera(direccion, sl_candidato, periodo_ms)
+        # sin notify() aca a proposito -- es una actualizacion rutinaria, no un evento
+    except Exception as e:
+        log.warning(f"Trailing 5m: no se pudo actualizar el SL: {e}")
+
 def colocar_sl_o_pasar_a_espera(direccion, sl_price_calc, periodo_ms):
     """Intenta colocar el SL con reintentos normales. Si el nivel calculado ya estaba
     superado por el precio (PosicionCerradaAMercado -- la posicion se cerro de
@@ -688,6 +738,8 @@ def ciclo():
                     estado["reentry_order_id"] = None
                     estado["sl_order_id"] = None
                     estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
+                    estado["extremo"] = estado["entry_price"]
+                    estado["ultimo_cierre_5m_ts"] = None
                     guardar_estado(estado)
                     if sl_price_calc is not None:
                         try:
@@ -696,11 +748,13 @@ def ciclo():
                             notify(f"⚠️ ALERTA: reentrada a mercado ejecutada pero el SL fallo: {e2}. Se reintentara el proximo ciclo.", level="error")
             return
 
-        # si arranca un nuevo periodo de 4h, recalcular y reemplazar el SL
-        if nuevo_periodo and sl_price_calc is not None and direccion_regimen == estado["position"]:
-            sl_anterior = estado["sl_price"]
-            if colocar_sl_o_pasar_a_espera(estado["position"], sl_price_calc, periodo_ms):
-                notify(f"🔄 SL actualizado (nuevo periodo 4h)\n{sl_anterior:.2f} → {estado['sl_price']:.2f}")
+        # Trailing cada 5 minutos (reemplaza la actualizacion que antes solo pasaba una
+        # vez por vela de 4h) -- corre en CADA ciclo, pero internamente solo actualiza
+        # de verdad cuando hay un cierre de 5m nuevo. Sin notificacion por Telegram
+        # (seria demasiado ruido); los eventos que importan siguen avisando igual.
+        if direccion_regimen == estado["position"] and vela_anterior is not None:
+            rango_anterior = vela_anterior["high"] - vela_anterior["low"]
+            actualizar_trailing_5m(estado["position"], rango_anterior, periodo_ms)
         return
 
     # --- Caso 2: esperando reentrada ---
@@ -724,6 +778,8 @@ def ciclo():
                 estado["reentry_order_id"] = None
                 estado["sl_order_id"] = None
                 estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
+                estado["extremo"] = estado["entry_price"]
+                estado["ultimo_cierre_5m_ts"] = None
                 guardar_estado(estado)
                 if sl_price_calc is not None:
                     try:
@@ -742,6 +798,8 @@ def ciclo():
             estado["reentry_order_id"] = None
             estado["sl_order_id"] = None
             estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
+            estado["extremo"] = estado["entry_price"]
+            estado["ultimo_cierre_5m_ts"] = None
             guardar_estado(estado)  # guardar YA, antes de intentar el SL, por la misma razon que en Caso 3
             # colocar el SL del periodo actual
             if sl_price_calc is not None:
@@ -777,6 +835,8 @@ def ciclo():
         estado["entry_price"] = float(orden_entrada.get("avgPrice", precio_actual)) or precio_actual
         estado["sl_order_id"] = None  # todavia no colocado -- se guarda YA asi el proximo ciclo lo detecta si algo falla abajo
         estado["sl_price"] = None  # nueva posicion -- no arrastrar el ratchet de la anterior
+        estado["extremo"] = estado["entry_price"]
+        estado["ultimo_cierre_5m_ts"] = None
         estado["current_period_open_time"] = periodo_ms
         guardar_estado(estado)
         log.info(f"Posicion abierta, guardando estado antes de intentar el SL...")
@@ -823,6 +883,8 @@ def reconciliar_estado_inicial():
             estado["sl_order_id"] = None
             notify("ALERTA: no se encontro SL para la posicion adoptada. Se intentara colocar uno en el proximo ciclo.", level="warning")
         estado["current_period_open_time"] = periodo_actual_ms()  # evita que el proximo ciclo crea que "cambio de periodo" y recalcule el SL sin necesidad
+        estado["extremo"] = estado["entry_price"]  # arranca el trailing 5m desde el precio de entrada conocido
+        estado["ultimo_cierre_5m_ts"] = None
         guardar_estado(estado)
         return
 
